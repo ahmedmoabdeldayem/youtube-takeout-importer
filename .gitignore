@@ -1,0 +1,24 @@
+# Session and progress files
+.yt_cookies.json
+.watch_progress.json
+login_ready.txt
+debug_playlist.png
+
+# YouTube Takeout personal data (ignore files, keep folder structure)
+YouTube and YouTube Music/**/*.csv
+YouTube and YouTube Music/**/*.html
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+CLAUDE.md
