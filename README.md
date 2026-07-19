@@ -122,3 +122,9 @@ Session cookies are saved to `.yt_cookies.json` and reused across scripts until 
 - macOS with Chrome 150
 - Python 3.14
 - Google Takeout export format as of 2025
+
+## Contributing & Support
+
+- **Questions?** Use the [Discussions](https://github.com/ahmedmoabdeldayem/youtube-takeout-importer/discussions) tab — ask anything and the community can help answer
+- **Found a bug?** Open an [Issue](https://github.com/ahmedmoabdeldayem/youtube-takeout-importer/issues) with details about what went wrong
+- **Want to contribute?** Fork the repo and submit a pull request
