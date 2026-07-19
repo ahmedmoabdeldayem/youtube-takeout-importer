@@ -30,6 +30,8 @@ Import your YouTube history, subscriptions, search history, and music library fr
 5. Click **Create export** — Google will email you a download link when it's ready
 6. Download and extract the zip — you'll find a `Takeout` folder inside
 
+> **Important:** These scripts are designed for the **HTML export format** (the default). When selecting your export format in Google Takeout, make sure history is exported as **HTML**, not JSON.
+
 ## Setup
 
 **1. Place the scripts inside your Takeout folder**, at the same level as the `YouTube and YouTube Music` folder:
