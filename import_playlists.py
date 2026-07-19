@@ -1,213 +1,221 @@
 import csv
+import hashlib
 import json
+import re
 import time
 from pathlib import Path
+import requests
 import chromedriver_autoinstaller
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 PLAYLISTS_CSV = Path(__file__).parent / "YouTube and YouTube Music/playlists/playlists.csv"
 COOKIES_FILE  = Path(__file__).parent / ".yt_cookies.json"
 SIGNAL_FILE   = Path(__file__).parent / "login_ready.txt"
 
-def login_and_save_cookies(driver):
-    print("Opening browser for login...")
+def login_and_save_cookies():
+    print("Opening Chrome incognito — log into your NEW YouTube account.")
+    print("Waiting for login", end="", flush=True)
+    chromedriver_autoinstaller.install()
+    opts = Options()
+    opts.add_argument("--incognito")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=opts)
     driver.get("https://www.youtube.com")
     SIGNAL_FILE.unlink(missing_ok=True)
-    print("Waiting for login", end="", flush=True)
     while not SIGNAL_FILE.exists():
         time.sleep(2)
         print(".", end="", flush=True)
     SIGNAL_FILE.unlink(missing_ok=True)
     cookies = driver.get_cookies()
     COOKIES_FILE.write_text(json.dumps(cookies))
-    print("\nSession saved.\n")
+    driver.quit()
+    print("\nBrowser closed. Session saved.\n")
     return cookies
 
-def build_driver(headless=True):
-    chromedriver_autoinstaller.install()
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--incognito")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=opts)
+def sapisid_hash(sapisid):
+    ts = int(time.time())
+    digest = hashlib.sha1(f"{ts} {sapisid} https://www.youtube.com".encode()).hexdigest()
+    return f"SAPISIDHASH {ts}_{digest}"
+
+def build_session(cookies):
+    session = requests.Session()
+    for c in cookies:
+        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".youtube.com"))
+    return session
+
+def get_headers(cookies):
+    sapisid = next((c["value"] for c in cookies if c["name"] == "SAPISID"), None)
+    if not sapisid:
+        sapisid = next((c["value"] for c in cookies if c["name"] == "__Secure-3PAPISID"), None)
+    return {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Authorization": sapisid_hash(sapisid),
+        "X-Goog-AuthUser": "0",
+        "X-Origin": "https://www.youtube.com",
+        "Content-Type": "application/json",
+        "Referer": "https://www.youtube.com",
+    }
+
+def get_yt_config(session, headers):
+    resp = session.get("https://www.youtube.com", headers=headers)
+    api_key    = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', resp.text)
+    client_ver = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', resp.text)
+    visitor    = re.search(r'"visitorData":"([^"]+)"', resp.text)
+    return (
+        api_key.group(1) if api_key else None,
+        client_ver.group(1) if client_ver else "2.20240101.00.00",
+        visitor.group(1) if visitor else ""
+    )
+
+def ctx(client_ver, visitor_data):
+    return {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": client_ver,
+                "visitorData": visitor_data,
+                "hl": "en",
+                "gl": "US",
+            }
+        }
+    }
 
 def load_playlist_videos(title):
     slug = title.lower().replace(" ", "-")
-    videos_file = Path(__file__).parent / f"YouTube and YouTube Music/playlists/{slug}-videos.csv"
-    if not videos_file.exists():
+    f = Path(__file__).parent / f"YouTube and YouTube Music/playlists/{slug}-videos.csv"
+    if not f.exists():
         return []
-    with open(videos_file, newline="", encoding="utf-8") as f:
-        return [row["Video ID"].strip() for row in csv.DictReader(f)]
+    with open(f, newline="", encoding="utf-8") as fp:
+        return [row["Video ID"].strip() for row in csv.DictReader(fp) if row["Video ID"].strip()]
 
-def create_playlist_and_add_videos(driver, title, privacy, videos):
-    wait = WebDriverWait(driver, 15)
+def like_video(session, headers, api_key, client_ver, visitor_data, video_id):
+    body = {**ctx(client_ver, visitor_data), "target": {"videoId": video_id}}
+    r = session.post(
+        f"https://www.youtube.com/youtubei/v1/like/like?key={api_key}",
+        headers=headers, json=body, timeout=10
+    )
+    return r.status_code in (200, 204)
 
-    # Go to a video page to trigger the "Save" menu (easiest way to create playlist)
-    if not videos:
-        print(f'  No videos for "{title}", skipping.')
-        return
+def add_to_playlist(session, headers, api_key, client_ver, visitor_data, playlist_id, video_id):
+    body = {
+        **ctx(client_ver, visitor_data),
+        "playlistId": playlist_id,
+        "actions": [{"addedVideoId": video_id, "action": "ACTION_ADD_VIDEO"}]
+    }
+    r = session.post(
+        f"https://www.youtube.com/youtubei/v1/browse/edit_playlist?key={api_key}",
+        headers=headers, json=body, timeout=10
+    )
+    return r.status_code in (200, 204)
 
-    first_video = videos[0]
-    print(f"  Opening video {first_video} to create playlist from Save menu...")
-    driver.get(f"https://www.youtube.com/watch?v={first_video}")
-    time.sleep(3)
+def create_playlist(session, headers, api_key, client_ver, visitor_data, title, privacy):
+    # Try given privacy first, fall back to PRIVATE if it fails
+    for p in [privacy.upper(), "PRIVATE"]:
+        body = {
+            **ctx(client_ver, visitor_data),
+            "title": title,
+            "privacyStatus": p,
+        }
+        r = session.post(
+            f"https://www.youtube.com/youtubei/v1/playlist/create?key={api_key}",
+            headers=headers, json=body, timeout=10
+        )
+        data = r.json()
+        playlist_id = data.get("playlistId")
+        if playlist_id:
+            print(f"  Created with privacy={p}")
+            return playlist_id
+        print(f"  privacy={p} failed ({r.status_code}), trying next...")
+    return None
 
-    def js_click(el):
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", el)
-
-    # Click the Save button under the video
-    try:
-        save_btn = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//button[.//yt-formatted-string[text()="Save"]] | //button[@aria-label="Save to playlist"]')
-        ))
-        js_click(save_btn)
-        time.sleep(2)
-    except Exception as e:
-        print(f"  Could not find Save button: {e}")
-        return
-
-    # Click "+ Create new playlist"
-    try:
-        new_pl_btn = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//*[contains(text(),"Create new playlist") or contains(text(),"New playlist")]')
-        ))
-        js_click(new_pl_btn)
-        time.sleep(1.5)
-    except Exception as e:
-        print(f"  Could not find New Playlist button: {e}")
-        return
-
-    # Save screenshot for debugging
-    driver.save_screenshot(str(Path(__file__).parent / "debug_playlist.png"))
-    print(f"  Screenshot saved. Looking for name input...")
-
-    # Type playlist name — try multiple selectors
-    name_input = None
-    for selector in [
-        (By.XPATH, '//input[@id="input"]'),
-        (By.XPATH, '//input[contains(@placeholder,"Name") or contains(@placeholder,"name")]'),
-        (By.CSS_SELECTOR, 'ytcp-text-input-field input'),
-        (By.CSS_SELECTOR, '#title-field input'),
-        (By.XPATH, '//input[@maxlength]'),
-        (By.XPATH, '//div[@contenteditable="true"]'),
-    ]:
-        try:
-            name_input = WebDriverWait(driver, 4).until(EC.presence_of_element_located(selector))
-            print(f"  Found input with selector: {selector}")
-            break
-        except Exception:
-            continue
-
-    if not name_input:
-        print(f"  Could not find name input. Check debug_playlist.png for the current state.")
-        return
-
-    name_input.clear()
-    name_input.send_keys(title)
-    time.sleep(0.5)
-
-    # Set privacy
-    try:
-        privacy_select = driver.find_element(By.TAG_NAME, "select")
-        for option in privacy_select.find_elements(By.TAG_NAME, "option"):
-            if privacy.lower() in option.text.lower():
-                js_click(option)
-                break
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    # Click Create
-    try:
-        create_btn = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//button[.//yt-formatted-string[text()="Create"] or .//span[text()="Create"]]')
-        ))
-        js_click(create_btn)
-        time.sleep(2)
-        print(f'  Playlist "{title}" created with first video!')
-    except Exception as e:
-        print(f"  Could not click Create: {e}")
-        return
-
-    # Add remaining videos
-    for vid in videos[1:]:
-        print(f"  Adding video {vid}...")
-        driver.get(f"https://www.youtube.com/watch?v={vid}")
-        time.sleep(3)
-        try:
-            save_btn = wait.until(EC.element_to_be_clickable(
-                (By.XPATH, '//button[.//yt-formatted-string[text()="Save"]] | //button[@aria-label="Save to playlist"]')
-            ))
-            save_btn.click()
-            time.sleep(1.5)
-
-            # Find the checkbox for our playlist
-            pl_checkbox = wait.until(EC.presence_of_element_located(
-                (By.XPATH, f'//*[contains(text(),"{title}")]//preceding-sibling::*[@id="checkbox"] | //*[contains(@title,"{title}")]')
-            ))
-            if "checked" not in pl_checkbox.get_attribute("class"):
-                pl_checkbox.click()
-            time.sleep(1)
-
-            # Close dialog
-            driver.find_element(By.TAG_NAME, "body").click()
-            time.sleep(0.5)
-            print(f"  Added.")
-        except Exception as e:
-            print(f"  Could not add video {vid}: {e}")
-
-def main():
+def load_playlists():
     playlists = []
     with open(PLAYLISTS_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if row["Playlist Title (Original)"].strip():
-                playlists.append(row)
+            title = row.get("Playlist Title (Original)", "").strip()
+            if title:
+                playlists.append({
+                    "id": row["Playlist ID"].strip(),
+                    "title": title,
+                    "privacy": row["Playlist Visibility"].strip(),
+                })
+    return playlists
 
-    print(f"Found {len(playlists)} playlist(s) to import.\n")
-
-    # Login with visible browser first
-    driver = build_driver(headless=False)
+def main():
+    playlists = load_playlists()
+    print(f"Found {len(playlists)} playlists.\n")
 
     if COOKIES_FILE.exists():
-        print("Found saved session, trying to reuse...")
-        driver.get("https://www.youtube.com")
-        for c in json.loads(COOKIES_FILE.read_text()):
-            try:
-                driver.add_cookie(c)
-            except Exception:
-                pass
-        driver.get("https://www.youtube.com")
-        time.sleep(2)
-        if "Sign in" in driver.page_source or "accounts.google" in driver.current_url:
-            print("Session expired.")
-            login_and_save_cookies(driver)
-        else:
-            print("Session still valid.\n")
+        cookies = json.loads(COOKIES_FILE.read_text())
     else:
-        login_and_save_cookies(driver)
+        cookies = login_and_save_cookies()
 
-    # Switch to headless not possible mid-session, so keep visible for now
-    # but minimize interaction — this runs fast anyway (only 1 playlist, 1 video)
+    session = build_session(cookies)
+    headers = get_headers(cookies)
+
+    print("Fetching YouTube config...")
+    api_key, client_ver, visitor_data = get_yt_config(session, headers)
+
+    if not api_key:
+        print("Session expired. Re-logging in...")
+        cookies = login_and_save_cookies()
+        session = build_session(cookies)
+        headers = get_headers(cookies)
+        api_key, client_ver, visitor_data = get_yt_config(session, headers)
+
+    print(f"Config ready.\n")
 
     for pl in playlists:
-        title   = pl["Playlist Title (Original)"].strip()
-        privacy = pl["Playlist Visibility"].strip()
+        title   = pl["title"]
+        pl_id   = pl["id"]
+        privacy = pl["privacy"]
         videos  = load_playlist_videos(title)
-        print(f'Playlist: "{title}" | Visibility: {privacy} | Videos: {len(videos)}')
-        create_playlist_and_add_videos(driver, title, privacy, videos)
-        print()
 
-    driver.quit()
-    print("Done importing playlists!")
+        print(f'Playlist: "{title}" | {len(videos)} videos | {privacy}')
+
+        # Determine playlist type by ID prefix
+        if pl_id.startswith("FL"):
+            # Favorites = liked videos
+            print("  Type: Favorites (liked videos) — liking each video...")
+            done = 0
+            for vid in videos:
+                ok = like_video(session, headers, api_key, client_ver, visitor_data, vid)
+                print(f"  {'liked' if ok else 'failed'}: {vid}")
+                done += 1 if ok else 0
+                time.sleep(0.3)
+            print(f"  Done: {done}/{len(videos)}\n")
+
+        elif title.lower() == "watch later":
+            # Watch Later = built-in playlist with ID "WL"
+            print("  Type: Watch Later — adding to WL playlist...")
+            done = 0
+            for vid in videos:
+                ok = add_to_playlist(session, headers, api_key, client_ver, visitor_data, "WL", vid)
+                print(f"  {'added' if ok else 'failed'}: {vid}")
+                done += 1 if ok else 0
+                time.sleep(0.3)
+            print(f"  Done: {done}/{len(videos)}\n")
+
+        else:
+            # Regular playlist — create it then add videos
+            print(f"  Type: Regular — creating playlist...")
+            new_id = create_playlist(session, headers, api_key, client_ver, visitor_data, title, privacy)
+            if not new_id:
+                print(f"  Failed to create playlist. Skipping.\n")
+                continue
+            print(f"  Created! ID: {new_id} — adding {len(videos)} videos...")
+            done = 0
+            for vid in videos:
+                ok = add_to_playlist(session, headers, api_key, client_ver, visitor_data, new_id, vid)
+                print(f"  {'added' if ok else 'failed'}: {vid}")
+                done += 1 if ok else 0
+                time.sleep(0.3)
+            print(f"  Done: {done}/{len(videos)}\n")
+
+    print("All playlists imported!")
 
 if __name__ == "__main__":
     main()
